@@ -1,6 +1,8 @@
 use crate::cli::{StdinStream, StdoutStream, WasiCliCtx};
 use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
-use crate::filesystem::{Dir, WasiFilesystemCtx};
+use crate::filesystem::{
+    Dir, WasiFilesystemCtx, WasiPathPolicy, WasiPathRule, normalize_host_policy_path,
+};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
 use crate::{DirPerms, FilePerms, OpenMode};
@@ -167,6 +169,29 @@ impl WasiCtxBuilder {
         self
     }
 
+    /// Configures a host-side filesystem policy for WASI path authorization.
+    ///
+    /// This policy is evaluated for each host filesystem access performed via
+    /// the preview2 filesystem interfaces, enabling path allow/deny semantics
+    /// even when a broad preopen (such as `/`) is present.
+    pub fn filesystem_path_policy(
+        &mut self,
+        rules: Vec<WasiPathRule>,
+        ancestor_allow: Vec<String>,
+    ) -> &mut Self {
+        self.filesystem.path_policy = Some(std::sync::Arc::new(WasiPathPolicy::new(
+            rules,
+            ancestor_allow,
+        )));
+        self
+    }
+
+    /// Clears any previously configured filesystem path policy.
+    pub fn clear_filesystem_path_policy(&mut self) -> &mut Self {
+        self.filesystem.path_policy = None;
+        self
+    }
+
     /// Appends multiple environment variables at once for this builder.
     ///
     /// All environment variables are appended to the list of environment
@@ -296,7 +321,10 @@ impl WasiCtxBuilder {
         dir_perms: DirPerms,
         file_perms: FilePerms,
     ) -> Result<&mut Self> {
-        let dir = cap_std::fs::Dir::open_ambient_dir(host_path.as_ref(), ambient_authority())?;
+        let host_path = host_path.as_ref();
+        let dir = cap_std::fs::Dir::open_ambient_dir(host_path, ambient_authority())?;
+        let normalized_host =
+            normalize_host_policy_path(host_path).unwrap_or_else(|| host_path.to_path_buf());
         let mut open_mode = OpenMode::empty();
         if dir_perms.contains(DirPerms::READ) {
             open_mode |= OpenMode::READ;
@@ -311,6 +339,8 @@ impl WasiCtxBuilder {
                 file_perms,
                 open_mode,
                 self.filesystem.allow_blocking_current_thread,
+                normalized_host,
+                self.filesystem.path_policy.clone(),
             ),
             guest_path.as_ref().to_owned(),
         ));

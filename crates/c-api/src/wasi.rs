@@ -33,12 +33,20 @@ unsafe fn create_file(path: *const c_char) -> Option<File> {
 #[repr(C)]
 pub struct wasi_config_t {
     builder: WasiCtxBuilder,
+    path_rules: Vec<wasmtime_wasi::WasiPathRule>,
+    ancestor_allow: Vec<String>,
 }
 
 wasmtime_c_api_macros::declare_own!(wasi_config_t);
 
 impl wasi_config_t {
     pub fn into_wasi_ctx(mut self) -> Result<WasiP1Ctx> {
+        if !self.path_rules.is_empty() || !self.ancestor_allow.is_empty() {
+            self.builder.filesystem_path_policy(
+                std::mem::take(&mut self.path_rules),
+                std::mem::take(&mut self.ancestor_allow),
+            );
+        }
         Ok(self.builder.build_p1())
     }
 }
@@ -47,6 +55,8 @@ impl wasi_config_t {
 pub extern "C" fn wasi_config_new() -> Box<wasi_config_t> {
     Box::new(wasi_config_t {
         builder: WasiCtxBuilder::new(),
+        path_rules: Vec::new(),
+        ancestor_allow: Vec::new(),
     })
 }
 
@@ -92,6 +102,48 @@ pub unsafe extern "C" fn wasi_config_set_env(
         };
         config.builder.env(k, v);
     }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_clear_fs_policy(config: &mut wasi_config_t) {
+    config.path_rules.clear();
+    config.ancestor_allow.clear();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_config_add_fs_policy_rule(
+    config: &mut wasi_config_t,
+    path: *const c_char,
+    allow_children: bool,
+    allow_create: bool,
+    support: bool,
+    deny: bool,
+) -> bool {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return false,
+    };
+    config.path_rules.push(wasmtime_wasi::WasiPathRule {
+        path: path.to_owned(),
+        allow_children,
+        allow_create,
+        support,
+        deny,
+    });
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_config_add_fs_policy_ancestor(
+    config: &mut wasi_config_t,
+    path: *const c_char,
+) -> bool {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return false,
+    };
+    config.ancestor_allow.push(path.to_owned());
     true
 }
 
@@ -327,4 +379,9 @@ pub unsafe extern "C" fn wasi_config_preopen_dir(
         .builder
         .preopened_dir(host_path, guest_path, dir_perms, file_perms)
         .is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_inherit_network(config: &mut wasi_config_t) {
+    config.builder.inherit_network();
 }

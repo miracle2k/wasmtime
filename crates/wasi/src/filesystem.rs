@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use cap_fs_ext::{FileTypeExt as _, MetadataExt as _};
 use fs_set_times::SystemTimeSpec;
 use std::collections::hash_map;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
 use wasmtime::component::{HasData, Resource, ResourceTable};
@@ -56,6 +57,7 @@ impl HasData for WasiFilesystem {
 pub struct WasiFilesystemCtx {
     pub(crate) allow_blocking_current_thread: bool,
     pub(crate) preopens: Vec<(Dir, String)>,
+    pub(crate) path_policy: Option<Arc<WasiPathPolicy>>,
 }
 
 pub struct WasiFilesystemCtxView<'a> {
@@ -81,6 +83,265 @@ bitflags::bitflags! {
         const READ = 0b1;
         const WRITE = 0b10;
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WasiPathRule {
+    pub path: String,
+    pub allow_children: bool,
+    pub allow_create: bool,
+    pub support: bool,
+    pub deny: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WasiPathPolicy {
+    rules: Vec<WasiPathRuleNormalized>,
+    ancestor_allow: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct WasiPathRuleNormalized {
+    path: PathBuf,
+    allow_children: bool,
+    allow_create: bool,
+    deny: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WasiPathPolicyReason {
+    DenyRule,
+    NotWhitelisted,
+}
+
+impl WasiPathPolicy {
+    pub fn new(rules: Vec<WasiPathRule>, ancestor_allow: Vec<String>) -> Self {
+        let mut normalized = Vec::with_capacity(rules.len() * 2);
+        for rule in rules {
+            let Some(path) = normalize_host_policy_path(Path::new(rule.path.trim())) else {
+                continue;
+            };
+            normalized.push(WasiPathRuleNormalized {
+                path: path.clone(),
+                allow_children: rule.allow_children,
+                allow_create: rule.allow_create,
+                deny: rule.deny,
+            });
+            if (rule.deny || rule.support)
+                && let Some(resolved) = resolve_symlink_path(&path)
+                && resolved != path
+            {
+                normalized.push(WasiPathRuleNormalized {
+                    path: resolved,
+                    allow_children: rule.allow_children,
+                    allow_create: rule.allow_create,
+                    deny: rule.deny,
+                });
+            }
+        }
+
+        let mut ancestors = Vec::with_capacity(ancestor_allow.len());
+        for path in ancestor_allow {
+            if let Some(normalized_path) = normalize_host_policy_path(Path::new(path.trim())) {
+                ancestors.push(normalized_path);
+            }
+        }
+
+        Self {
+            rules: normalized,
+            ancestor_allow: ancestors,
+        }
+    }
+
+    fn match_deny<'a>(&'a self, path: &Path) -> Option<&'a Path> {
+        for rule in &self.rules {
+            if !rule.deny {
+                continue;
+            }
+            if path == rule.path {
+                return Some(&rule.path);
+            }
+            if rule.allow_children && is_path_within(&rule.path, path) {
+                return Some(&rule.path);
+            }
+        }
+        None
+    }
+
+    fn match_allow(&self, path: &Path, create: bool) -> bool {
+        for rule in &self.rules {
+            if rule.deny {
+                continue;
+            }
+            if !create {
+                if path == rule.path {
+                    return true;
+                }
+                if rule.allow_children && is_path_within(&rule.path, path) {
+                    return true;
+                }
+                continue;
+            }
+            if rule.allow_create {
+                if path == rule.path {
+                    return true;
+                }
+                if rule.allow_children && is_path_within(&rule.path, path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn is_allowed_resolved(&self, path: &Path, create: bool) -> Result<(), WasiPathPolicyReason> {
+        if self.match_deny(path).is_some() {
+            return Err(WasiPathPolicyReason::DenyRule);
+        }
+        if !self.match_allow(path, create) {
+            return Err(WasiPathPolicyReason::NotWhitelisted);
+        }
+
+        if let Some(resolved) = resolve_symlink_path(path)
+            && resolved != path
+        {
+            if self.match_deny(&resolved).is_some() {
+                return Err(WasiPathPolicyReason::DenyRule);
+            }
+            if !self.match_allow(&resolved, create) {
+                return Err(WasiPathPolicyReason::NotWhitelisted);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_ancestor_allowed_for_requests(&self, path: &Path) -> bool {
+        self.ancestor_allow
+            .iter()
+            .any(|allowed| path == allowed || is_path_within(path, allowed))
+    }
+
+    fn check_path(
+        &self,
+        path: &Path,
+        create: bool,
+        allow_ancestor_probe: bool,
+    ) -> Result<(), ErrorCode> {
+        match self.is_allowed_resolved(path, create) {
+            Ok(()) => Ok(()),
+            Err(reason)
+                if !create
+                    && reason != WasiPathPolicyReason::DenyRule
+                    && allow_ancestor_probe
+                    && self.is_ancestor_allowed_for_requests(path) =>
+            {
+                Ok(())
+            }
+            Err(_) => {
+                if create {
+                    Err(ErrorCode::NotPermitted)
+                } else {
+                    Err(ErrorCode::NoEntry)
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn normalize_host_policy_path(path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(lexical_clean_path(&absolute))
+}
+
+fn is_path_within(base: &Path, candidate: &Path) -> bool {
+    candidate == base || candidate.starts_with(base)
+}
+
+fn lexical_clean_path(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut prefix: Option<std::ffi::OsString> = None;
+    let mut has_root = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => prefix = Some(p.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(last) = parts.last()
+                    && last != ".."
+                {
+                    parts.pop();
+                    continue;
+                }
+                if !has_root {
+                    parts.push("..".into());
+                }
+            }
+            Component::Normal(n) => parts.push(n.to_os_string()),
+        }
+    }
+
+    let mut result = PathBuf::new();
+    if let Some(p) = prefix {
+        result.push(p);
+    }
+    if has_root {
+        result.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+    }
+    for part in parts {
+        result.push(part);
+    }
+    if result.as_os_str().is_empty() {
+        if has_root {
+            result.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+        } else {
+            result.push(".");
+        }
+    }
+    result
+}
+
+fn nearest_existing_dir(path: &Path) -> Option<PathBuf> {
+    let mut current = lexical_clean_path(path);
+    loop {
+        if let Ok(meta) = std::fs::metadata(&current)
+            && meta.is_dir()
+        {
+            return Some(current);
+        }
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return Some(current);
+        }
+        current = parent;
+    }
+}
+
+fn resolve_symlink_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(lexical_clean_path(&resolved));
+    }
+
+    let parent = path.parent()?;
+    if let Ok(resolved_parent) = std::fs::canonicalize(parent) {
+        if let Some(name) = path.file_name() {
+            return Some(lexical_clean_path(&resolved_parent.join(name)));
+        }
+    }
+
+    let nearest = nearest_existing_dir(parent)?;
+    let resolved_nearest = std::fs::canonicalize(&nearest).ok()?;
+    let rel = path.strip_prefix(&nearest).ok()?;
+    Some(lexical_clean_path(&resolved_nearest.join(rel)))
 }
 
 bitflags::bitflags! {
@@ -473,7 +734,13 @@ impl Descriptor {
                 f.run_blocking(|f| f.metadata()).await
             }
             Self::Dir(d) => {
-                // No permissions check on metadata: if opened, allowed to stat it
+                if let Err(err) = d.check_self_access(false, true) {
+                    let kind = match err {
+                        ErrorCode::NoEntry => std::io::ErrorKind::NotFound,
+                        _ => std::io::ErrorKind::PermissionDenied,
+                    };
+                    return Err(std::io::Error::from(kind));
+                }
                 d.run_blocking(|d| d.dir_metadata()).await
             }
         }
@@ -578,6 +845,7 @@ impl Descriptor {
                 if !d.perms.contains(DirPerms::MUTATE) {
                     return Err(ErrorCode::NotPermitted);
                 }
+                d.check_self_access(true, false)?;
                 d.run_blocking(|d| d.set_times(atim, mtim)).await?;
                 Ok(())
             }
@@ -621,7 +889,7 @@ impl Descriptor {
                 Ok(meta.into())
             }
             Self::Dir(d) => {
-                // No permissions check on stat: if opened, allowed to stat it
+                d.check_self_access(false, true)?;
                 let meta = d.run_blocking(|d| d.dir_metadata()).await?;
                 Ok(meta.into())
             }
@@ -791,6 +1059,8 @@ pub struct Dir {
     pub open_mode: OpenMode,
 
     pub(crate) allow_blocking_current_thread: bool,
+    pub(crate) host_path: Arc<PathBuf>,
+    pub(crate) path_policy: Option<Arc<WasiPathPolicy>>,
 }
 
 impl Dir {
@@ -800,6 +1070,8 @@ impl Dir {
         file_perms: FilePerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        host_path: PathBuf,
+        path_policy: Option<Arc<WasiPathPolicy>>,
     ) -> Self {
         Dir {
             dir: Arc::new(dir),
@@ -807,6 +1079,8 @@ impl Dir {
             file_perms,
             open_mode,
             allow_blocking_current_thread,
+            host_path: Arc::new(host_path),
+            path_policy,
         }
     }
 
@@ -843,10 +1117,54 @@ impl Dir {
         &self.dir
     }
 
+    fn resolve_child_host_path(&self, path: &str) -> Result<PathBuf, ErrorCode> {
+        let rel = Path::new(path);
+        if rel.is_absolute() {
+            return Err(ErrorCode::NotPermitted);
+        }
+        let joined = lexical_clean_path(&self.host_path.join(rel));
+        if !is_path_within(&self.host_path, &joined) {
+            return Err(ErrorCode::NotPermitted);
+        }
+        Ok(joined)
+    }
+
+    fn check_policy_host_path(
+        &self,
+        host_path: &Path,
+        create: bool,
+        allow_ancestor_probe: bool,
+    ) -> Result<(), ErrorCode> {
+        if let Some(policy) = self.path_policy.as_ref() {
+            policy.check_path(host_path, create, allow_ancestor_probe)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_self_access(
+        &self,
+        create: bool,
+        allow_ancestor_probe: bool,
+    ) -> Result<(), ErrorCode> {
+        self.check_policy_host_path(&self.host_path, create, allow_ancestor_probe)
+    }
+
+    fn check_child_access(
+        &self,
+        path: &str,
+        create: bool,
+        allow_ancestor_probe: bool,
+    ) -> Result<PathBuf, ErrorCode> {
+        let host_path = self.resolve_child_host_path(path)?;
+        self.check_policy_host_path(&host_path, create, allow_ancestor_probe)?;
+        Ok(host_path)
+    }
+
     pub(crate) async fn create_directory_at(&self, path: String) -> Result<(), ErrorCode> {
         if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&path, true, false)?;
         self.run_blocking(move |d| d.create_dir(&path)).await?;
         Ok(())
     }
@@ -859,6 +1177,8 @@ impl Dir {
         if !self.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted);
         }
+
+        let _ = self.check_child_access(&path, false, true)?;
 
         let meta = if path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
             self.run_blocking(move |d| d.metadata(&path)).await?
@@ -881,6 +1201,7 @@ impl Dir {
         if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&path, true, false)?;
         if path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
             self.run_blocking(move |d| {
                 d.set_times(
@@ -919,6 +1240,9 @@ impl Dir {
         if old_path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
             return Err(ErrorCode::Invalid);
         }
+        let _ = self.check_child_access(&old_path, false, false)?;
+        let _ = new_dir.check_child_access(&new_path, true, false)?;
+
         let new_dir_handle = Arc::clone(&new_dir.dir);
         self.run_blocking(move |d| d.hard_link(&old_path, &new_dir_handle, &new_path))
             .await?;
@@ -1016,6 +1340,14 @@ impl Dir {
             return Err(ErrorCode::NotPermitted);
         }
 
+        let host_path = self.resolve_child_host_path(&path)?;
+        let is_dir_probe = !create
+            && (oflags.contains(OpenFlags::DIRECTORY)
+                || std::fs::metadata(&host_path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false));
+        self.check_policy_host_path(&host_path, create, is_dir_probe)?;
+
         // Represents each possible outcome from the spawn_blocking operation.
         // This makes sure we don't have to give spawn_blocking any way to
         // manipulate the table.
@@ -1059,6 +1391,8 @@ impl Dir {
                 self.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                resolve_symlink_path(&host_path).unwrap_or_else(|| host_path.clone()),
+                self.path_policy.clone(),
             ))),
 
             OpenResult::File(file) => Ok(Descriptor::File(File::new(
@@ -1076,6 +1410,7 @@ impl Dir {
         if !self.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&path, false, false)?;
         let link = self.run_blocking(move |d| d.read_link(&path)).await?;
         link.into_os_string()
             .into_string()
@@ -1086,6 +1421,7 @@ impl Dir {
         if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&path, true, false)?;
         self.run_blocking(move |d| d.remove_dir(&path)).await?;
         Ok(())
     }
@@ -1102,6 +1438,9 @@ impl Dir {
         if !new_dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&old_path, false, false)?;
+        let _ = new_dir.check_child_access(&new_path, true, false)?;
+
         let new_dir_handle = Arc::clone(&new_dir.dir);
         self.run_blocking(move |d| d.rename(&old_path, &new_dir_handle, &new_path))
             .await?;
@@ -1120,6 +1459,7 @@ impl Dir {
         if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&dest_path, true, false)?;
         self.run_blocking(move |d| d.symlink(&src_path, &dest_path))
             .await?;
         Ok(())
@@ -1131,6 +1471,7 @@ impl Dir {
         if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted);
         }
+        let _ = self.check_child_access(&path, true, false)?;
         self.run_blocking(move |d| d.remove_file_or_symlink(&path))
             .await?;
         Ok(())
@@ -1141,7 +1482,7 @@ impl Dir {
         path_flags: PathFlags,
         path: String,
     ) -> Result<MetadataHashValue, ErrorCode> {
-        // No permissions check on metadata: if dir opened, allowed to stat it
+        let _ = self.check_child_access(&path, false, true)?;
         let meta = self
             .run_blocking(move |d| {
                 if path_flags.contains(PathFlags::SYMLINK_FOLLOW) {

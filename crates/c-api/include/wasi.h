@@ -92,6 +92,27 @@ WASI_API_EXTERN bool wasi_config_set_env(wasi_config_t *config, size_t envc,
                                          const char *values[]);
 
 /**
+ * \brief Clears any configured filesystem path policy rules.
+ */
+WASI_API_EXTERN void wasi_config_clear_fs_policy(wasi_config_t *config);
+
+/**
+ * \brief Adds a filesystem path policy rule.
+ *
+ * Rules are evaluated by WASI preview2 filesystem operations to determine
+ * whether a host path is accessible.
+ */
+WASI_API_EXTERN bool wasi_config_add_fs_policy_rule(
+    wasi_config_t *config, const char *path, bool allow_children,
+    bool allow_create, bool support, bool deny);
+
+/**
+ * \brief Adds an ancestor-allow path used for metadata probes.
+ */
+WASI_API_EXTERN bool
+wasi_config_add_fs_policy_ancestor(wasi_config_t *config, const char *path);
+
+/**
  * \brief Indicates that the entire environment of the calling process should be
  * inherited by this WASI configuration.
  */

@@ -160,6 +160,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if !d.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
+        d.check_self_access(false, true)?;
 
         enum ReaddirError {
             Io(std::io::Error),

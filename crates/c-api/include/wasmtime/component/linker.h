@@ -163,7 +163,27 @@ WASM_API_EXTERN wasmtime_error_t *wasmtime_component_linker_instance_add_func(
 WASM_API_EXTERN wasmtime_error_t *
 wasmtime_component_linker_add_wasip2(wasmtime_component_linker_t *linker);
 
+#ifdef WASMTIME_FEATURE_WASI_HTTP
+
+/**
+ * \brief Add WASI HTTP interfaces into the \p linker provided.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_add_wasi_http(wasmtime_component_linker_t *linker);
+
+#endif // WASMTIME_FEATURE_WASI_HTTP
+
 #endif // WASMTIME_FEATURE_WASI
+
+#if defined(WASMTIME_FEATURE_WASI) && defined(WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC)
+
+/**
+ * \brief Add all WASI P3 interfaces into the \p linker provided.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_add_wasip3(wasmtime_component_linker_t *linker);
+
+#endif // WASMTIME_FEATURE_WASI && WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
 
 /// Type of the callback used in
 /// #wasmtime_component_linker_instance_add_resource
